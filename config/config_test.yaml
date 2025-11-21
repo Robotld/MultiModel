@@ -1,0 +1,78 @@
+data:
+  num_classes: 2
+  root_dirs:
+    - 'E:\data3d\nodule_patches96_5'
+  output_dir: 'test_result'
+#  class_names: ['低分化', '中分化', '高分化', '原位癌', '微浸润']
+  class_names: ['Invasive', 'Non-invasive']
+
+model:
+  threshold: 0.661612
+  params:
+    image_size: [96, 96, 96] # 96 * 96 * 96
+    patch_size: 6
+    dim: 768
+    depth: 6
+    heads: 6
+    mlp_dim: 128
+    mlp_num: 2
+    pool: 'max' # mean max all
+    cpt_num: 5
+
+training:
+  device: "cuda"
+  random_seed: 42
+  batch_size: 32
+  num_epochs: 20
+  num_workers: 4
+  use_amp: false
+  cache_dataset: True
+  warmup_epochs: 3
+  warmup_type: "linear"
+  max_grad_norm: 1.0
+  crop_size: [42, 42, 18]
+  augment: True
+  pretrained_path: 'E:\workplace\3D\src\train_output\train_20250515_225517\best_auc_model_4.pth'
+  frozen: false
+  frozen1: false
+  frozen2: false
+
+losses:
+  CrossEntropyLoss:
+    enabled: True
+    weight: 1.0
+    params: #{} # 如果 CrossEntropyLoss无需参数  但为了保持一致，以及不报错， 这里需要用空字典占位
+  FocalLoss:
+    enabled: false  # enabled false 表示 默认不启用
+    weight: 1.0
+    params:
+      gamma: 2.0
+      alpha: 0.25
+  BoundaryFlowLoss:
+    enabled: false
+    weight: 1.0
+    params:
+      weight: 0.7
+      margin: 0.3
+  SimilarityLoss:
+    enabled: true
+    params:
+      low: 0.3
+      high: 0.7
+
+cross_validation:
+  n_splits: 5
+  shuffle: true
+
+optimizer:
+  name: "AdamW"
+  params:
+    lr: 0.00005
+    weight_decay: 0.5
+
+scheduler:
+  name: "CosineAnnealingLR"
+  params:
+    T_max: 20
+    eta_min: 5e-6
+
