@@ -116,7 +116,6 @@ class ViT3D(VisionTransformer):
 
         # 提取类别提示向量
         class_prompt_features = x[:, 1:self.num_cls]
-        similarity_loss = self.prompt_cosine_similarity_loss(0.3, 0.7)
 
         # 提取分类令牌和补丁令牌（不包括类别提示向量）
         cls_token_out = x[:, 0]  # (batch_size, dim)
@@ -133,7 +132,7 @@ class ViT3D(VisionTransformer):
         combined_features = torch.cat([class_prompts_pooled,cls_token_out], dim=1)
         # 最终分类头
         out = self.mlp_head(combined_features)
-        return out, x, None, similarity_loss
+        return out, x, None
 
     def load_pretrained_dino(self, path):
         """加载预训练的DINOv2权重"""
