@@ -3,6 +3,8 @@
 整合CT图像、病理报告和人口学特征进行端到端训练
 """
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+import os
 import time
 import numpy as np
 import torch
@@ -18,8 +20,8 @@ from models import create_transforms, MulCrossValidator, ViT3D
 from models import MultimodalDataset
 from models import MultimodalMultitaskModel
 from utils import update_config_from_args, parse_args, ConfigManager, set_seed
+from utils.entity_masking import MedicalEntityMasker  # ✅ 新增
 from train_multimodal import train
-
 
 
 def main():
@@ -73,10 +75,14 @@ def main():
     # 显示数据集基本信息
     print(f"数据集样本总数: {len(dataset.samples)}")
 
+    # ============== ✅ 先初始化 entity_masker，获取 vocab_size ==============
+    entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2, 0.3, 0.4])
+    entity_vocab_size = entity_masker.vocab_size
+    print(f"✅ 实体词表大小: {entity_vocab_size}")
+
     # 初始化交叉验证器
     cv = MulCrossValidator(dataset, config)
     device = config.training['device']
-
 
     # 存储每折的最佳F1, AUC分数
     fold_scores = []
@@ -100,9 +106,6 @@ def main():
 
     # 进行交叉验证
     for fold, train_loader, val_loader, train_counter in cv.get_folds(train_transforms, val_transforms):
-        # # # 记录每个fold的数据计数器，用于计算类别权重
-        # if fold != 9:
-        #     continue
         train_loader.dataset._data_counter = train_counter
 
         # 清理GPU内存
@@ -123,23 +126,32 @@ def main():
                 if os.path.isdir(config.training['pretrained_path']):
                     vit3d_model.load_pretrained_dino(config.training['pretrained_path'])
                 else:
-                    vit3d_model.load_state_dict(torch.load(config.training['pretrained_path'], map_location=device), strict=False)
+                    vit3d_model.load_state_dict(
+                        torch.load(config.training['pretrained_path'], map_location=device),
+                        strict=False
+                    )
                 print(f"成功加载ViT3D权重: {config.training['pretrained_path']}")
             except Exception as e:
                 print(f"加载ViT3D预训练权重出错: {str(e)}")
 
-        # 2. 构建多模态模型
+        # 2. 构建多模态模型（✅ 现在可以安全使用 entity_vocab_size）
         model = MultimodalMultitaskModel(
             vit_3d_model=vit3d_model,
             image_dim=config.model["params"]["dim"],
             bert_model_name=config.model['bert_model_name'],
             text_feature_dim=config.model['text_feature_dim'],
-            demographic_dim=config.model['demographic_dim'],  # 年龄和性别 吸烟史
+            demographic_dim=config.model['demographic_dim'],
             fusion_dim=config.model['fusion_dim'],
             num_classes_recurrence=config.data['num_classes'],
             fusion_transformer_heads=config.model['fusion_transformer_heads'],
             fusion_transformer_layers=config.model['fusion_transformer_layers'],
             dropout=config.model['dropout'],
+            entity_vocab_size=entity_vocab_size,  # ✅ 使用已初始化的 vocab_size
+            # decoder 参数
+            use_entity_decoder=True,
+            decoder_num_layers=3,
+            decoder_num_heads=6,
+            decoder_max_seq_len=64,
         )
 
         model.to(device)
@@ -164,7 +176,9 @@ def main():
             fold=fold,
             train_dir=train_dir,
             best_f1=0,
-            best_auc=0
+            best_auc=0,
+            use_entity_decoder=True,  # ✅ 启用 decoder
+            decoder_weight=0.3,  # ✅ decoder loss 权重（可调）
         )
 
         if best_auc <= auc:

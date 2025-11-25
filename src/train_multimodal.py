@@ -5,15 +5,13 @@ import pandas as pd
 import torch
 from torch import optim
 from tqdm import tqdm
-from sklearn.metrics import roc_curve, auc, confusion_matrix
-from transformers import BertTokenizer
-# 假设这些是从您的项目中导入的
+from transformers import AutoTokenizer
+
 from models import WarmupScheduler, MultitaskLoss
 from utils import save_training_history, save_config, calculate_metrics
 from utils.entity_masking import MedicalEntityMasker
 
 
-# --- Helper Functions 保持不变 ---
 def save_best_model_if_improved(model, metric_value, metric_name, train_dir, epoch, fold):
     print(f"\n保存新的最佳模型，{metric_name}: {metric_value:.4f}，在第{epoch + 1}轮")
     save_path = f'{train_dir}/best_{metric_name}_model_{fold}.pth'
@@ -32,67 +30,80 @@ def save_metrics_to_csv(metrics_dict, file_path):
     return metrics_dict
 
 
-# --- 核心重构部分 ---
-
-def one_epoch_multimodal_train(model, data_loader, optimizer, criterion, device,
-                               train=True, scaler=None, use_amp=False, max_grad_norm=1.0,
-                               entity_masker=None, tokenizer=None, use_masked_prediction=False):
-    """
-    重构后的单 Epoch 训练/评估函数：
-    1. 统一了 Train/Eval 的前向传播流程，消除冗余。
-    2. 优化了 AMP 和 梯度裁剪 的逻辑。
-    """
+def one_epoch_multimodal_train(
+        model,
+        data_loader,
+        optimizer,
+        criterion,
+        device,
+        train: bool = True,
+        scaler=None,
+        use_amp: bool = False,
+        max_grad_norm: float = 1.0,
+        entity_masker: MedicalEntityMasker = None,
+        tokenizer=None,
+        use_entity_decoder: bool = False,
+        decoder_weight: float = 0.5,
+):
     model.train() if train else model.eval()
 
-    # 初始化统计变量
-    losses = {'total': 0.0, 'rec': 0.0, 'axis': 0.0, 'masked': 0.0, 'masked_acc': 0.0}
+    losses = {'total': 0.0, 'rec': 0.0, 'axis': 0.0, 'decoder': 0.0}
     all_probs, all_labels = [], []
     features_list = []
 
-    loader = tqdm(data_loader, desc=f"{'训练中' if train else '评估中'}")
+    loader = tqdm(data_loader, desc="训练中" if train else "评估中")
 
-    # 使用 set_grad_enabled 统一上下文，只在 train 时开启梯度计算
     with torch.set_grad_enabled(train):
         for batch_data in loader:
-            # 1. 数据搬运
             images = batch_data["image"].to(device)
             text_inputs = {k: v.to(device) for k, v in batch_data["text"].items()}
             demographics = batch_data["demographic"].to(device)
             rec_labels = batch_data["label"].to(device)
             axis_labels = batch_data["nodule_axis_label"].to(device)
 
-            # 2. 动态遮挡处理 (仅在需要时)
             masked_inputs, target_ids = None, None
-            if use_masked_prediction and entity_masker and tokenizer:
-                # 注意：通常验证集也可以计算此 Loss 作为监控，但如果不想在验证时 Mask，可加 if train: 判断
-                if "original_text" in batch_data:
-                    masked_txt, target_ids_ts = entity_masker.batch_mask(batch_data["original_text"])
-                    masked_inputs = tokenizer(masked_txt, padding=True, truncation=True, max_length=512,
-                                              return_tensors='pt')
-                    masked_inputs = {k: v.to(device) for k, v in masked_inputs.items()}
-                    target_ids = target_ids_ts.to(device)
 
-            # 3. 前向传播 (封装 AMP 上下文)
-            # 如果不使用 AMP，autocast 上下文没有任何副作用，可以安全包裹
+            if use_entity_decoder and entity_masker is not None and tokenizer is not None:
+                if "original_text" in batch_data:
+                    original_texts = batch_data["original_text"]
+                    # batch_mask 返回 (masked_texts, target_ids [B,K], spans [B,K,2])
+                    masked_txt, target_ids_ts, _ = entity_masker.batch_mask(original_texts)
+
+                    masked_inputs = tokenizer(
+                        masked_txt,
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors='pt'
+                    )
+                    masked_inputs = {k: v.to(device) for k, v in masked_inputs.items()}
+                    target_ids = target_ids_ts.to(device)  # [B, K]
+
             with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(
-                    images, text_inputs, demographics,
+                    images,
+                    text_inputs,
+                    demographics,
                     masked_text_inputs=masked_inputs,
-                    target_entity_ids=target_ids
+                    target_entity_ids=target_ids,
                 )
 
                 rec_logits = outputs['recurrence_logits']
                 axis_preds = outputs['axis_preds']
-                # 获取各项 Loss
-                main_loss, rec_loss_item, axis_loss_item = criterion(rec_logits, axis_preds, rec_labels, axis_labels)
 
-                # 组合 Loss
-                loss = main_loss + outputs['contrastive_loss'] + outputs['masked_entity_loss']
+                main_loss, rec_loss_item, axis_loss_item = criterion(
+                    rec_logits,
+                    axis_preds,
+                    rec_labels,
+                    axis_labels
+                )
 
-            # 4. 反向传播与优化 (仅训练)
+                # 组合 loss: 主任务 + decoder_weight * decoder_loss
+                loss = main_loss + outputs['contrastive_loss'] + decoder_weight * outputs['decoder_loss']
+
             if train:
                 optimizer.zero_grad()
-                if scaler:
+                if scaler is not None:
                     scaler.scale(loss).backward()
                     if max_grad_norm > 0:
                         scaler.unscale_(optimizer)
@@ -105,133 +116,177 @@ def one_epoch_multimodal_train(model, data_loader, optimizer, criterion, device,
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
 
-            # 5. 统计与记录
-            batch_size = images.size(0)  # 实际上 len(loader) 已经足够，这里简单累加
             losses['total'] += loss.item()
             losses['rec'] += rec_loss_item.item()
-            losses['masked'] += outputs['masked_entity_loss'].item() if isinstance(outputs['masked_entity_loss'],
-                                                                                   torch.Tensor) else 0
+            if isinstance(axis_loss_item, torch.Tensor):
+                losses['axis'] += axis_loss_item.item()
+            losses['decoder'] += outputs['decoder_loss'].item() if isinstance(
+                outputs['decoder_loss'], torch.Tensor
+            ) else 0.0
 
-            # 特征收集
-            if outputs['fusion_feature'] is not None:
+            if outputs.get('fusion_feature', None) is not None:
                 features_list.append(outputs['fusion_feature'].detach().cpu().numpy())
 
-            # 分类指标收集
             valid_mask = (rec_labels != -1)
             if valid_mask.any():
                 probs = torch.softmax(rec_logits[valid_mask], dim=1).detach().cpu().numpy()
                 all_probs.extend(probs)
                 all_labels.extend(rec_labels[valid_mask].cpu().numpy())
 
-            # 遮挡准确率
-            if use_masked_prediction and outputs['predicted_entities'] is not None and target_ids is not None:
-                valid_ent = (target_ids[:, 0] != -1)
-                if valid_ent.any():
-                    acc = (outputs['predicted_entities'][valid_ent] == target_ids[:, 0][
-                        valid_ent]).float().mean().item()
-                    losses['masked_acc'] += acc
-
-    # 6. Epoch 结束汇总
     num_batches = len(data_loader)
     avg_loss = {k: v / num_batches for k, v in losses.items()}
 
     if features_list:
         features_concat = np.vstack(features_list)
         print(
-            f"[{'Train' if train else 'Val'}] 特征分布: Mean={np.mean(features_concat):.4f}, Std={np.std(features_concat):.4f}")
+            f"[{'Train' if train else 'Val'}] 特征分布: "
+            f"Mean={np.mean(features_concat):.4f}, Std={np.std(features_concat):.4f}"
+        )
 
     metrics_dict = {
         'probabilities': np.array(all_probs),
         'labels': np.array(all_labels) if all_labels else np.array([]),
     }
 
-    return avg_loss['total'], metrics_dict, {
+    loss_dict = {
         'total_loss': avg_loss['total'],
         'recurrence_loss': avg_loss['rec'],
-        'masked_entity_loss': avg_loss['masked'],
-        'masked_entity_acc': avg_loss['masked_acc']
+        'axis_loss': avg_loss['axis'],
+        'decoder_loss': avg_loss['decoder'],
     }
 
+    return avg_loss['total'], metrics_dict, loss_dict
 
-def train(model, train_loader, val_loader, config, fold, device, args,
-          warmup_epochs=3, warmup_type='linear', max_grad_norm=1.0, train_dir=None,
-          best_f1=0, best_auc=0, use_masked_prediction=True):
+
+def train(
+        model,
+        train_loader,
+        val_loader,
+        config,
+        fold,
+        device,
+        args,
+        warmup_epochs: int = 3,
+        warmup_type: str = 'linear',
+        max_grad_norm: float = 1.0,
+        train_dir: str = None,
+        best_f1: float = 0.0,
+        best_auc: float = 0.0,
+        use_entity_decoder: bool = True,
+        decoder_weight: float = 0.5,
+):
     os.makedirs(train_dir, exist_ok=True)
     save_config(config, os.path.join(train_dir, 'config.yaml'))
 
-    # 初始化 Mask 工具
     entity_masker, tokenizer = None, None
-    if use_masked_prediction:
-        entity_masker = MedicalEntityMasker(mask_ratio=0.5)
-        tokenizer = BertTokenizer.from_pretrained(config.model.get('bert_model_name', 'hfl/chinese-roberta-wwm-ext'))
-        print(f"✅ 启用遮挡关键词预测")
+    if use_entity_decoder:
+        entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2, 0.3, 0.4])
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model.get('bert_model_name', 'hfl/chinese-roberta-wwm-ext'),
+            use_fast=True
+        )
+        print(f"✅ 启用实体序列生成 decoder，遮挡比例: {entity_masker.mask_ratio_choices}")
 
     criterion = MultitaskLoss(
         recurrence_weight=config.losses['MultitaskLoss']['recurrence_weight'],
         axis_weight=config.losses['MultitaskLoss']['axis_weight'],
     )
 
-    optimizer = getattr(optim, config.optimizer["name"])(model.parameters(), **config.get_optimizer_params(model))
-    base_scheduler = getattr(optim.lr_scheduler, config.scheduler["name"])(optimizer, **config.get_scheduler_params())
-    scheduler = WarmupScheduler(optimizer, warmup_epochs=warmup_epochs, base_scheduler=base_scheduler,
-                                warmup_type=warmup_type)
+    optimizer = getattr(optim, config.optimizer["name"])(
+        model.parameters(),
+        **config.get_optimizer_params(model)
+    )
+    base_scheduler = getattr(optim.lr_scheduler, config.scheduler["name"])(
+        optimizer,
+        **config.get_scheduler_params()
+    )
+    scheduler = WarmupScheduler(
+        optimizer,
+        warmup_epochs=warmup_epochs,
+        base_scheduler=base_scheduler,
+        warmup_type=warmup_type
+    )
 
     use_amp = (device.type == 'cuda') and getattr(args, 'use_amp', False)
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    if use_amp: print("启用混合精度训练 (AMP)")
+    if use_amp:
+        print("启用混合精度训练 (AMP)")
 
-    # ⚠️ 关键修改：移除了极其危险的 "验证集全量缓存到GPU" 逻辑 ⚠️
-    # 显存应该只存当前 Batch，不要存整个 Dataset
-    print(f"验证集样本数: {len(val_loader.dataset)} (不进行显存预缓存)")
+    print(f"验证集样本数: {len(val_loader.dataset)}")
 
     train_metrics_history, val_metrics_history = [], []
     best_val_metrics, best_train_metrics = None, None
-    best_val_auc, best_val_f1 = 0, 0
+    best_val_auc, best_val_f1 = 0.0, 0.0
     best_f1_model_state, best_auc_model_state = None, None
 
-    # 早停机制
     patience = getattr(args, 'patience', 10)
     patience_counter = 0
 
     for epoch in range(args.epochs):
         start_time = time.time()
 
-        # --- Train ---
-        train_loss, train_metrics, train_loss_dict = one_epoch_multimodal_train(
-            model, train_loader, optimizer, criterion, device,
-            train=True, scaler=scaler, use_amp=use_amp, max_grad_norm=max_grad_norm,
-            entity_masker=entity_masker, tokenizer=tokenizer, use_masked_prediction=True
+        train_loss, train_metrics_raw, train_loss_dict = one_epoch_multimodal_train(
+            model=model,
+            data_loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            train=True,
+            scaler=scaler,
+            use_amp=use_amp,
+            max_grad_norm=max_grad_norm,
+            entity_masker=entity_masker,
+            tokenizer=tokenizer,
+            use_entity_decoder=use_entity_decoder,
+            decoder_weight=decoder_weight,
         )
 
-        # --- Val ---
-        val_loss, val_metrics, val_loss_dict = one_epoch_multimodal_train(
-            model, val_loader, optimizer, criterion, device,
-            train=False, scaler=scaler, use_amp=use_amp, max_grad_norm=max_grad_norm,
-            entity_masker=entity_masker, tokenizer=tokenizer, use_masked_prediction=False
+        val_loss, val_metrics_raw, val_loss_dict = one_epoch_multimodal_train(
+            model=model,
+            data_loader=val_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            train=False,
+            scaler=scaler,
+            use_amp=use_amp,
+            max_grad_norm=max_grad_norm,
+            entity_masker=entity_masker,
+            tokenizer=tokenizer,
+            use_entity_decoder=False,  # 验证时不计算 decoder loss
+            decoder_weight=0.0,
         )
 
-        # 计算指标
-        train_metrics = calculate_metrics(train_metrics, config.data['num_classes'])
-        val_metrics = calculate_metrics(val_metrics, config.data['num_classes'])
+        train_metrics = calculate_metrics(train_metrics_raw, config.data['num_classes'])
+        val_metrics = calculate_metrics(val_metrics_raw, config.data['num_classes'])
 
         epoch_time = time.time() - start_time
         current_lr = optimizer.param_groups[0]['lr']
 
-        # 记录历史
         train_metrics_history.append(train_metrics)
         val_metrics_history.append(val_metrics)
 
-        # 打印日志
-        print(f'\nFold {fold + 1}, Epoch {epoch + 1}/{args.epochs} - {epoch_time:.2f}s, LR: {current_lr:.6e}')
         print(
-            f" Train | Loss: {train_loss:.4f} | AUC: {train_metrics['auc']:.4f} | F1: {train_metrics['micro_f1']:.4f}")
-        print(f" Val   | Loss: {val_loss:.4f} | AUC: {val_metrics['auc']:.4f} | F1: {val_metrics['micro_f1']:.4f}")
+            f'\nFold {fold + 1}, Epoch {epoch + 1}/{args.epochs} '
+            f'- {epoch_time:.2f}s, LR: {current_lr:.6e}'
+        )
+        print(
+            f" Train | Loss: {train_loss:.4f} "
+            f"| AUC: {train_metrics['auc']:.4f} "
+            f"| F1: {train_metrics['micro_f1']:.4f}"
+        )
+        print(
+            f" Val   | Loss: {val_loss:.4f} "
+            f"| AUC: {val_metrics['auc']:.4f} "
+            f"| F1: {val_metrics['micro_f1']:.4f}"
+        )
 
-        if use_masked_prediction:
+        if use_entity_decoder:
             print(
-                f" Mask  | Train Acc: {train_loss_dict['masked_entity_acc']:.4f} | Val Acc: {val_loss_dict['masked_entity_acc']:.4f}")
+                f" Decoder | Train Loss: {train_loss_dict['decoder_loss']:.4f} "
+                f"| Val Loss: {val_loss_dict['decoder_loss']:.4f}"
+            )
 
-        # 保存最佳模型逻辑
         if val_metrics['auc'] > best_val_auc:
             best_val_auc = val_metrics['auc']
             best_val_metrics = val_metrics.copy()
@@ -245,21 +300,19 @@ def train(model, train_loader, val_loader, config, fold, device, args,
             best_val_f1 = val_metrics['micro_f1']
             best_f1_model_state = model.state_dict().copy()
 
-        if train_metrics['auc'] > getattr(best_train_metrics, 'get', lambda k, v: 0)('auc', 0):  # safe check
+        if best_train_metrics is None or train_metrics['auc'] > best_train_metrics.get('auc', 0):
             best_train_metrics = train_metrics.copy()
 
         scheduler.step()
 
-        # Early Stopping check could go here
         if patience_counter >= patience:
             print(f"早停触发：验证集 AUC 未提升持续 {patience} 轮")
             break
 
-    # 保存最终结果
-    if best_val_metrics:
+    if best_val_metrics is not None:
         best_dir = os.path.join(train_dir, 'best_metrics')
         save_metrics_to_csv(best_val_metrics, os.path.join(best_dir, f'best_val_metrics_fold_{fold}.csv'))
-        if best_train_metrics:
+        if best_train_metrics is not None:
             save_metrics_to_csv(best_train_metrics, os.path.join(best_dir, f'best_train_metrics_fold_{fold}.csv'))
 
     save_training_history(train_dir, fold, train_metrics_history, val_metrics_history)
