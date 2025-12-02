@@ -32,7 +32,7 @@ class MultitaskLoss(nn.Module):
     """
 
     def __init__(self,
-                 recurrence_weight=1.0,
+                 classification_weight=1.0,
                  axis_weight=1.0,
                  use_focal_loss=False):
         """
@@ -42,14 +42,14 @@ class MultitaskLoss(nn.Module):
             use_focal_loss: 是否对复发预测使用Focal Loss
         """
         super().__init__()
-        self.recurrence_weight = recurrence_weight
+        self.classification_weight = classification_weight
         self.axis_weight = axis_weight
 
         # 复发预测损失
         if use_focal_loss:
-            self.recurrence_criterion = FocalLoss(gamma=2.0, alpha=0.25)
+            self.criterion = FocalLoss(gamma=2.0, alpha=0.25)
         else:
-            self.recurrence_criterion = nn.CrossEntropyLoss(
+            self.criterion = nn.CrossEntropyLoss(
                 weight=torch.tensor([1.0, 1.0], device='cuda')
             )
 
@@ -57,28 +57,28 @@ class MultitaskLoss(nn.Module):
         self.axis_criterion = nn.MSELoss()
 
     def forward(self,
-                recurrence_logits,
+                logits,
                 axis_preds,
-                recurrence_labels,
+                labels,
                 axis_labels):
         """
         计算多任务损失（❌ 去掉 similarity_loss）
 
         参数:
-            recurrence_logits: 复发预测的输出 [B, 2]
+            logits: 分类输出 [B, 2]
             axis_preds: 结节长短径预测 [B, 2]
-            recurrence_labels: 复发标签 [B]
+            labels: 分类标签 [B]
             axis_labels: 真实长短径 [B, 2]
 
         返回:
             total_loss: 总损失
-            recurrence_loss: 复发预测损失
+            loss: 分类损失
             axis_loss: 回归损失
         """
         # 1. 复发预测损失
-        recurrence_loss = self.recurrence_criterion(
-            recurrence_logits,
-            recurrence_labels.long()
+        classification_loss = self.criterion(
+            logits,
+            labels.long()
         )
 
         # 2. 长短径回归损失
@@ -86,11 +86,11 @@ class MultitaskLoss(nn.Module):
 
         # 3. 总损失（❌ 不包含 similarity_loss）
         total_loss = (
-                self.recurrence_weight * recurrence_loss +
+                self.classification_weight * classification_loss +
                 self.axis_weight * axis_loss
         )
 
-        return total_loss, recurrence_loss, axis_loss
+        return total_loss, classification_loss, axis_loss
 
 
 # 更新注册表

@@ -139,19 +139,20 @@ def main():
             vit_3d_model=vit3d_model,
             image_dim=config.model["params"]["dim"],
             bert_model_name=config.model['bert_model_name'],
+            tokenizer=tokenizer,
             text_feature_dim=config.model['text_feature_dim'],
             demographic_dim=config.model['demographic_dim'],
             fusion_dim=config.model['fusion_dim'],
-            num_classes_recurrence=config.data['num_classes'],
+            num_classes=config.data['num_classes'],
             fusion_transformer_heads=config.model['fusion_transformer_heads'],
             fusion_transformer_layers=config.model['fusion_transformer_layers'],
             dropout=config.model['dropout'],
             entity_vocab_size=entity_vocab_size,  # ✅ 使用已初始化的 vocab_size
             # decoder 参数
             use_entity_decoder=True,
-            decoder_num_layers=3,
-            decoder_num_heads=6,
-            decoder_max_seq_len=64,
+            decoder_num_layers=4,
+            decoder_num_heads=4,
+            decoder_max_seq_len=32,
         )
 
         model.to(device)
@@ -167,6 +168,7 @@ def main():
         # 训练模型
         f1, auc, f1_model, auc_model = train(
             model=model,
+            tokenizer=tokenizer,
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
@@ -178,7 +180,7 @@ def main():
             best_f1=0,
             best_auc=0,
             use_entity_decoder=True,  # ✅ 启用 decoder
-            decoder_weight=0.3,  # ✅ decoder loss 权重（可调）
+            decoder_weight=0.5,  # ✅ decoder loss 权重（可调）
         )
 
         if best_auc <= auc:

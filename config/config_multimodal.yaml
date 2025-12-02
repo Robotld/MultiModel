@@ -16,7 +16,7 @@ data:
 model:
   params:
     image_size: [96, 96, 96] # 96 * 96 * 96
-    patch_size: 6
+    patch_size: 8
     dim: 768
     depth: 6
     heads: 6
@@ -47,7 +47,7 @@ training:
   warmup_epochs: 3
   warmup_type: "linear"
   max_grad_norm: 1.0
-  crop_size: [42, 42, 18]
+  crop_size: [96, 96, 32]
   augment: true
   pretrained_path: 'E:\workplace\MultiModel\pred_model\rad_dino'
   bert_pretrained_path: 'E:\workplace\3D\pred_model\bert_chinese' # 如果有预训练的BERT模型，可以在这里指定
@@ -79,8 +79,8 @@ losses:
       high: 0.7
   MultitaskLoss:
     enabled: true
-    recurrence_weight: 1.0  # 复发预测任务权重
-    axis_weight: 1.0 #   长短经
+    classification_weight: 1.0  # 复发预测任务权重
+    axis_weight: 0.5 #   长短经
 
 
 cross_validation:

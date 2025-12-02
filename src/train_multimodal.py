@@ -44,10 +44,12 @@ def one_epoch_multimodal_train(
         tokenizer=None,
         use_entity_decoder: bool = False,
         decoder_weight: float = 0.5,
+        contrastive_weight: float = 1.0,  # 新增：对比学习权重，默认1.0，和模型里保持一致
 ):
     model.train() if train else model.eval()
 
-    losses = {'total': 0.0, 'rec': 0.0, 'axis': 0.0, 'decoder': 0.0}
+    # 新增 contrastive 统计
+    losses = {'total': 0.0, 'cls': 0.0, 'axis': 0.0, 'decoder': 0.0, 'contrastive': 0.0}
     all_probs, all_labels = [], []
     features_list = []
 
@@ -58,11 +60,10 @@ def one_epoch_multimodal_train(
             images = batch_data["image"].to(device)
             text_inputs = {k: v.to(device) for k, v in batch_data["text"].items()}
             demographics = batch_data["demographic"].to(device)
-            rec_labels = batch_data["label"].to(device)
+            cls_labels = batch_data["label"].to(device)
             axis_labels = batch_data["nodule_axis_label"].to(device)
 
             masked_inputs, target_ids = None, None
-
             if use_entity_decoder and entity_masker is not None and tokenizer is not None:
                 if "original_text" in batch_data:
                     original_texts = batch_data["original_text"]
@@ -88,18 +89,25 @@ def one_epoch_multimodal_train(
                     target_entity_ids=target_ids,
                 )
 
-                rec_logits = outputs['recurrence_logits']
+                logits = outputs['logits']
                 axis_preds = outputs['axis_preds']
 
-                main_loss, rec_loss_item, axis_loss_item = criterion(
-                    rec_logits,
+                main_loss, cls_loss_item, axis_loss_item = criterion(
+                    logits,
                     axis_preds,
-                    rec_labels,
+                    cls_labels,
                     axis_labels
                 )
 
-                # 组合 loss: 主任务 + decoder_weight * decoder_loss
-                loss = main_loss + outputs['contrastive_loss'] + decoder_weight * outputs['decoder_loss']
+                contrastive_loss = outputs['contrastive_loss']  # 模型中已经算好
+                decoder_loss = outputs['decoder_loss']
+
+                # 组合 loss: 主任务 + 对比学习 + decoder 辅助任务
+                loss = (
+                    main_loss
+                    + contrastive_weight * contrastive_loss
+                    + decoder_weight * decoder_loss
+                )
 
             if train:
                 optimizer.zero_grad()
@@ -116,22 +124,26 @@ def one_epoch_multimodal_train(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
 
-            losses['total'] += loss.item()
-            losses['rec'] += rec_loss_item.item()
+            # ====== 统计各项 loss ======
+            losses['total'] += float(loss.item())
+            losses['cls'] += float(cls_loss_item.item())
             if isinstance(axis_loss_item, torch.Tensor):
-                losses['axis'] += axis_loss_item.item()
-            losses['decoder'] += outputs['decoder_loss'].item() if isinstance(
-                outputs['decoder_loss'], torch.Tensor
-            ) else 0.0
+                losses['axis'] += float(axis_loss_item.item())
+            if isinstance(decoder_loss, torch.Tensor):
+                losses['decoder'] += float(decoder_loss.item())
+            if isinstance(contrastive_loss, torch.Tensor):
+                losses['contrastive'] += float(contrastive_loss.item())
 
+            # ====== 记录特征用于分析 ======
             if outputs.get('fusion_feature', None) is not None:
                 features_list.append(outputs['fusion_feature'].detach().cpu().numpy())
 
-            valid_mask = (rec_labels != -1)
+            # ====== 分类概率 & 标签 ======
+            valid_mask = (cls_labels != -1)
             if valid_mask.any():
-                probs = torch.softmax(rec_logits[valid_mask], dim=1).detach().cpu().numpy()
+                probs = torch.softmax(logits[valid_mask], dim=1).detach().cpu().numpy()
                 all_probs.extend(probs)
-                all_labels.extend(rec_labels[valid_mask].cpu().numpy())
+                all_labels.extend(cls_labels[valid_mask].cpu().numpy())
 
     num_batches = len(data_loader)
     avg_loss = {k: v / num_batches for k, v in losses.items()}
@@ -150,9 +162,10 @@ def one_epoch_multimodal_train(
 
     loss_dict = {
         'total_loss': avg_loss['total'],
-        'recurrence_loss': avg_loss['rec'],
+        'cls_loss': avg_loss['cls'],
         'axis_loss': avg_loss['axis'],
         'decoder_loss': avg_loss['decoder'],
+        'contrastive_loss': avg_loss['contrastive'],
     }
 
     return avg_loss['total'], metrics_dict, loss_dict
@@ -160,6 +173,7 @@ def one_epoch_multimodal_train(
 
 def train(
         model,
+        tokenizer,
         train_loader,
         val_loader,
         config,
@@ -174,21 +188,18 @@ def train(
         best_auc: float = 0.0,
         use_entity_decoder: bool = True,
         decoder_weight: float = 0.5,
+        contrastive_weight: float = 0.5,  # 新增：全局控制对比损失权重
 ):
     os.makedirs(train_dir, exist_ok=True)
     save_config(config, os.path.join(train_dir, 'config.yaml'))
 
-    entity_masker, tokenizer = None, None
+    entity_masker = None
     if use_entity_decoder:
-        entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2, 0.3, 0.4])
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model.get('bert_model_name', 'hfl/chinese-roberta-wwm-ext'),
-            use_fast=True
-        )
+        entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2])
         print(f"✅ 启用实体序列生成 decoder，遮挡比例: {entity_masker.mask_ratio_choices}")
 
     criterion = MultitaskLoss(
-        recurrence_weight=config.losses['MultitaskLoss']['recurrence_weight'],
+        classification_weight=config.losses['MultitaskLoss']['classification_weight'],
         axis_weight=config.losses['MultitaskLoss']['axis_weight'],
     )
 
@@ -239,6 +250,7 @@ def train(
             tokenizer=tokenizer,
             use_entity_decoder=use_entity_decoder,
             decoder_weight=decoder_weight,
+            contrastive_weight=contrastive_weight,
         )
 
         val_loss, val_metrics_raw, val_loss_dict = one_epoch_multimodal_train(
@@ -253,8 +265,9 @@ def train(
             max_grad_norm=max_grad_norm,
             entity_masker=entity_masker,
             tokenizer=tokenizer,
-            use_entity_decoder=False,  # 验证时不计算 decoder loss
-            decoder_weight=0.0,
+            use_entity_decoder=False,  # 验证时不计算 decoder loss，但仍然有 contrastive_loss（如果你想关掉也可以设权重为0）
+            decoder_weight=0,
+            contrastive_weight=contrastive_weight,
         )
 
         train_metrics = calculate_metrics(train_metrics_raw, config.data['num_classes'])
@@ -287,6 +300,12 @@ def train(
                 f"| Val Loss: {val_loss_dict['decoder_loss']:.4f}"
             )
 
+        print(
+            f" Contrastive | Train Loss: {train_loss_dict['contrastive_loss']:.4f} "
+            f"| Val Loss: {val_loss_dict['contrastive_loss']:.4f}"
+        )
+
+        # 早停 & best model
         if val_metrics['auc'] > best_val_auc:
             best_val_auc = val_metrics['auc']
             best_val_metrics = val_metrics.copy()
