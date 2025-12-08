@@ -18,8 +18,8 @@ model:
     image_size: [96, 96, 96] # 96 * 96 * 96
     patch_size: 8
     dim: 768
-    depth: 6
-    heads: 6
+    depth: 8
+    heads: 8
     mlp_dim: 128
     mlp_num: 2
     pool: 'max' # mean max all
@@ -34,7 +34,7 @@ model:
 
   dropout: 0.5
   prompt_num: 0  # 提示向量数量
-  fusion_method: "concat"  # attention, concat, sum
+  fusion_type: "cls"  # cls  cross_attn
 
 training:
   device: "cuda"
@@ -47,13 +47,18 @@ training:
   warmup_epochs: 3
   warmup_type: "linear"
   max_grad_norm: 1.0
-  crop_size: [96, 96, 32]
+  crop_size: [96, 96, 16]
   augment: true
   pretrained_path: 'E:\workplace\MultiModel\pred_model\rad_dino'
   bert_pretrained_path: 'E:\workplace\3D\pred_model\bert_chinese' # 如果有预训练的BERT模型，可以在这里指定
   frozen1: false # 冻结图像编码器
   frozen2: true # 冻结文本编码器
-  frozen_prompt: false  # 不冻结提示向量
+
+  decoder: true
+  decoder_weight: 1.0
+  decoder_num_layers: 4
+  decoder_num_heads: 4
+  decoder_max_seq_len: 32
 
 losses:
   CrossEntropyLoss:
@@ -79,8 +84,9 @@ losses:
       high: 0.7
   MultitaskLoss:
     enabled: true
-    classification_weight: 1.0  # 复发预测任务权重
-    axis_weight: 0.5 #   长短经
+    classification_weight: 1.0  # 分类权重
+    axis_weight: 0 #   长短经
+    contrastive_weight: 0
 
 
 cross_validation:
@@ -97,7 +103,7 @@ optimizer:
   name: "AdamW"
   params:
     lr: 0.00001
-    weight_decay: 0.01
+    weight_decay: 0.001
 
 scheduler:
   name: "CosineAnnealingLR"

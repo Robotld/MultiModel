@@ -1,16 +1,19 @@
 data:
   num_classes: 2
-  root_dirs:
-    - 'E:\data3d\nodule_patches96_5'
-  output_dir: 'test_result'
+  csv_path:
+    #    - 'E:\workplace\3D\datasets\CTreport\河南省人民患者信息_updated.csv'
+    #    - "E:\\workplace\\3D\\datasets\\CTreport\\湖北省人民1.csv"
+    #    - "E:\\workplace\\3D\\datasets\\CTreport\\湖北省人民2019-2021补充_updated.csv"
+    - "E:\\workplace\\3D\\datasets\\CTreport\\广州呼研所患者信息_updated.csv"
+  output_dir: 'E:\workplace\MultiModel\test_result'
 #  class_names: ['低分化', '中分化', '高分化', '原位癌', '微浸润']
   class_names: ['Invasive', 'Non-invasive']
+  max_text_length: 512
 
 model:
-  threshold: 0.661612
   params:
     image_size: [96, 96, 96] # 96 * 96 * 96
-    patch_size: 6
+    patch_size: 8
     dim: 768
     depth: 6
     heads: 6
@@ -18,6 +21,18 @@ model:
     mlp_num: 2
     pool: 'max' # mean max all
     cpt_num: 5
+  bert_model_name: 'E:\workplace\3D\pred_model\bert_chinese'
+  tokenizer_path: 'E:\workplace\3D\pred_model\bert_chinese'
+  text_feature_dim: 768
+  demographic_dim: 4
+  fusion_dim: 384
+  fusion_transformer_heads: 4
+  fusion_transformer_layers: 4
+
+  dropout: 0.5
+  prompt_num: 0  # 提示向量数量
+  fusion_type: "cls"  # cls   cross_attn
+
 
 training:
   device: "cuda"
@@ -30,12 +45,19 @@ training:
   warmup_epochs: 3
   warmup_type: "linear"
   max_grad_norm: 1.0
-  crop_size: [42, 42, 18]
-  augment: True
-  pretrained_path: 'E:\workplace\3D\src\train_output\train_20250515_225517\best_auc_model_4.pth'
-  frozen: false
-  frozen1: false
-  frozen2: false
+  crop_size: [96, 96, 18]
+  augment: true
+  pretrained_path: 'E:\workplace\MultiModel\pred_model\rad_dino'
+  bert_pretrained_path: 'E:\workplace\3D\pred_model\bert_chinese' # 如果有预训练的BERT模型，可以在这里指定
+  frozen1: false # 冻结图像编码器
+  frozen2: true # 冻结文本编码器
+  frozen_prompt: false  # 不冻结提示向量
+
+  decoder: false
+  decoder_weight: 1.0
+  decoder_num_layers: 6
+  decoder_num_heads: 6
+  decoder_max_seq_len: 32
 
 losses:
   CrossEntropyLoss:
@@ -60,6 +82,11 @@ losses:
       low: 0.3
       high: 0.7
 
+  MultitaskLoss:
+    enabled: true
+    classification_weight: 1.0  # 分类权重
+    axis_weight: 0.5 #   长短经
+
 cross_validation:
   n_splits: 5
   shuffle: true
@@ -67,7 +94,7 @@ cross_validation:
 optimizer:
   name: "AdamW"
   params:
-    lr: 0.00005
+    lr: 0.00001
     weight_decay: 0.5
 
 scheduler:

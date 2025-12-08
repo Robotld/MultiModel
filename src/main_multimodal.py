@@ -76,7 +76,7 @@ def main():
     print(f"数据集样本总数: {len(dataset.samples)}")
 
     # ============== ✅ 先初始化 entity_masker，获取 vocab_size ==============
-    entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2, 0.3, 0.4])
+    entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.4])
     entity_vocab_size = entity_masker.vocab_size
     print(f"✅ 实体词表大小: {entity_vocab_size}")
 
@@ -148,11 +148,12 @@ def main():
             fusion_transformer_layers=config.model['fusion_transformer_layers'],
             dropout=config.model['dropout'],
             entity_vocab_size=entity_vocab_size,  # ✅ 使用已初始化的 vocab_size
+            fusion_type=config.model['fusion_type'],  # cross_attn   cls
             # decoder 参数
-            use_entity_decoder=True,
-            decoder_num_layers=4,
-            decoder_num_heads=4,
-            decoder_max_seq_len=32,
+            use_entity_decoder=config.training['decoder'],
+            decoder_num_layers=config.training['decoder_num_layers'],
+            decoder_num_heads=config.training['decoder_num_heads'],
+            decoder_max_seq_len=20,
         )
 
         model.to(device)
@@ -179,8 +180,9 @@ def main():
             train_dir=train_dir,
             best_f1=0,
             best_auc=0,
-            use_entity_decoder=True,  # ✅ 启用 decoder
-            decoder_weight=0.5,  # ✅ decoder loss 权重（可调）
+            use_entity_decoder=config.training['decoder'],  # ✅ 启用 decoder
+            decoder_weight=config.training['decoder_weight'],  # ✅ decoder loss 权重（可调）
+            contrastive_weight=config.losses['MultitaskLoss']['contrastive_weight']
         )
 
         if best_auc <= auc:

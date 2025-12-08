@@ -195,7 +195,7 @@ def train(
 
     entity_masker = None
     if use_entity_decoder:
-        entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.2])
+        entity_masker = MedicalEntityMasker(mask_ratio_choices=[0.4])
         print(f"✅ 启用实体序列生成 decoder，遮挡比例: {entity_masker.mask_ratio_choices}")
 
     criterion = MultitaskLoss(
@@ -263,7 +263,7 @@ def train(
             scaler=scaler,
             use_amp=use_amp,
             max_grad_norm=max_grad_norm,
-            entity_masker=entity_masker,
+            entity_masker=None,
             tokenizer=tokenizer,
             use_entity_decoder=False,  # 验证时不计算 decoder loss，但仍然有 contrastive_loss（如果你想关掉也可以设权重为0）
             decoder_weight=0,
